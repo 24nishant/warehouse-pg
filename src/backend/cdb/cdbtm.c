@@ -395,7 +395,8 @@ notifyCommittedDtxTransaction(void)
 
 	foreach(l, MyTmGxactLocal->waitGxids)
 	{
-		GxactLockTableWait(lfirst_int(l));
+		DistributedTransactionId *gxid = (DistributedTransactionId *) lfirst(l);
+		GxactLockTableWait(*gxid);
 	}
 }
 
@@ -1226,11 +1227,15 @@ isMppTxOptions_ExplicitBegin(int txnOptions)
 /*=========================================================================
  * HELPER FUNCTIONS
  */
+
+/*
+ * cmp function for DistributedTransactionId
+ */
 static int
-compare_int(const void *va, const void *vb)
+compare_int64(const void *va, const void *vb)
 {
-	int			a = *((const int *) va);
-	int			b = *((const int *) vb);
+	int64		a = *((const int64 *) va);
+	int64		b = *((const int64 *) vb);
 
 	if (a == b)
 		return 0;
@@ -1261,9 +1266,9 @@ doDispatchDtxProtocolCommand(DtxProtocolCommand dtxProtocolCommand,
 
 	char	   *dtxProtocolCommandStr = 0;
 
+	DistributedTransactionId *waitGxids = NULL;
 	struct pg_result **results;
 	MemoryContext oldContext;
-	int *waitGxids = NULL;
 	int totalWaits = 0;
 
 	if (!dtxSegments)
@@ -1355,7 +1360,7 @@ doDispatchDtxProtocolCommand(DtxProtocolCommand dtxProtocolCommand,
 		totalWaits += results[i]->nWaits;
 
 	if (totalWaits > 0)
-		waitGxids = palloc(sizeof(int) * totalWaits);
+		waitGxids = palloc(sizeof(DistributedTransactionId) * totalWaits);
 
 	totalWaits = 0;
 	for (i = 0; i < resultCount; i++)
@@ -1364,7 +1369,7 @@ doDispatchDtxProtocolCommand(DtxProtocolCommand dtxProtocolCommand,
 
 		if (result->nWaits > 0)
 		{
-			memcpy(&waitGxids[totalWaits], result->waitGxids, sizeof(int) * result->nWaits);
+			memcpy(&waitGxids[totalWaits], result->waitGxids, sizeof(DistributedTransactionId) * result->nWaits);
 			totalWaits += result->nWaits;
 		}
 		PQclear(result);
@@ -1372,21 +1377,25 @@ doDispatchDtxProtocolCommand(DtxProtocolCommand dtxProtocolCommand,
 
 	if (totalWaits > 0)
 	{
-		int lastRepeat = -1;
+		int64 lastRepeat = -1;
 		if (MyTmGxactLocal->waitGxids)
 		{
-			list_free(MyTmGxactLocal->waitGxids);
+			list_free_deep(MyTmGxactLocal->waitGxids);
 			MyTmGxactLocal->waitGxids = NULL;
 		}
 
-		qsort(waitGxids, totalWaits, sizeof(int), compare_int);
+		qsort(waitGxids, totalWaits, sizeof(DistributedTransactionId), compare_int64);
 
 		oldContext = MemoryContextSwitchTo(TopTransactionContext);
 		for (i = 0; i < totalWaits; i++)
 		{
 			if (waitGxids[i] == lastRepeat)
 				continue;
-			MyTmGxactLocal->waitGxids = lappend_int(MyTmGxactLocal->waitGxids, waitGxids[i]);
+
+			DistributedTransactionId *datum_gxid = palloc(sizeof(DistributedTransactionId));
+			*datum_gxid = waitGxids[i];
+
+			MyTmGxactLocal->waitGxids = lappend(MyTmGxactLocal->waitGxids, datum_gxid);
 			lastRepeat = waitGxids[i];
 		}
 		MemoryContextSwitchTo(oldContext);
@@ -1483,7 +1492,7 @@ resetTmGxact(void)
 	MyTmGxactLocal->isOnePhaseCommit = false;
 	if (MyTmGxactLocal->waitGxids != NULL)
 	{
-		list_free(MyTmGxactLocal->waitGxids);
+		list_free_deep(MyTmGxactLocal->waitGxids);
 		MyTmGxactLocal->waitGxids = NULL;
 	}
 	setCurrentDtxState(DTX_STATE_NONE);
@@ -2085,7 +2094,8 @@ sendWaitGxidsToQD(List *waitGxids)
 	pq_sendint(&buf, len, 4);
 	foreach(lc, waitGxids)
 	{
-		pq_sendint(&buf, lfirst_int(lc), 4);
+		DistributedTransactionId *gxid = (DistributedTransactionId *) lfirst(lc);
+		pq_sendint64(&buf, *gxid);
 	}
 	pq_endmessage(&buf);
 }
