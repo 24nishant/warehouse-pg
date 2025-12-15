@@ -21,7 +21,6 @@ sudo yum install -y apr-devel \
 	libcurl-devel \
 	libevent-devel \
 	libxml2-devel \
-	libyaml-devel \
 	libzstd-devel \
 	openssh-clients \
 	openssh-server \
@@ -38,6 +37,8 @@ sudo yum install -y apr-devel \
 	rsync \
 	xerces-c-devel \
 	zlib-devel
+
+sudo yum --enablerepo=powertools install -y libyaml-devel
 
 # These dependencies are installed by `yum install`
 # pip3 install -r python-dependencies.txt

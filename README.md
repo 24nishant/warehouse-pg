@@ -17,20 +17,27 @@ performance on large data volumes.
 The [Greenplum Database OSS project](https://github.com/greenplum-db/gpdb-archive) was released under the [Apache 2
 license](https://github.com/greenplum-db/gpdb-archive/blob/main/LICENSE) and went closed source in May 2024.
 
+## Building WarehousePG Database
+
+### Installing dependencies (for Linux developers)
+
+Follow [appropriate linux steps](README.RHEL-Rocky.md) for getting your system ready for WarehousePG
+
 ### Build the database
 
-Follow [appropriate Linux steps](README.RHEL-Rocky.bash) for getting your system ready.
-
 ```
-# Configure build environment to install at /usr/local/whpg
-./configure --with-perl --with-python --with-libxml --with-gssapi --prefix=/usr/local/whpg
+# Initialize and update submodules in the repository
+git submodule update --init
+
+# Configure build environment to install at /usr/local/warehousepg
+./configure --with-perl --with-python --with-libxml --with-gssapi --prefix=/usr/local/warehousepg
 
 # Compile and install
 make -j8
 make -j8 install
 
 # Bring in greenplum environment into your running shell
-source /usr/local/whpg/greenplum_path.sh
+source /usr/local/warehousepg/greenplum_path.sh
 
 # Start demo cluster
 make create-demo-cluster
