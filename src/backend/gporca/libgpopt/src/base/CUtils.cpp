@@ -2574,6 +2574,7 @@ CUtils::FScalarConstFalse(CExpression *pexpr)
 }
 
 //	create an array of expression's output columns including a key for grouping
+//  The Key columns' usage can be !=EUsed.
 CColRefArray *
 CUtils::PdrgpcrGroupingKey(
 	CMemoryPool *mp, CExpression *pexpr,
@@ -2611,6 +2612,15 @@ CUtils::PdrgpcrGroupingKey(
 		pdrgpcrKey = pkc->PdrgpcrKey(mp);
 	}
 	GPOS_ASSERT(nullptr != pdrgpcrKey);
+
+	for (ULONG i = 0; i < pdrgpcrKey->Size(); i++)
+	{
+		// Mark keys as EUSED.
+		// This prevents key columns from being pruned later (MakeDXLTableDescr),
+		// which could cause crashes in semijoin/EXISTS query plans
+		// when ORCA uses grouping keys.
+		(*pdrgpcrKey)[i]->MarkAsUsed();
+	}
 
 	CColRefSet *pcrsKey = GPOS_NEW(mp) CColRefSet(mp, pdrgpcrKey);
 	pcrsUsedOuter->Union(pcrsKey);
