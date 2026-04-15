@@ -1,4 +1,4 @@
-name: WarehousePG ABI Tests
+name: ABI Tests
 
 on:
   workflow_dispatch:
@@ -33,7 +33,7 @@ jobs:
       - name: Fetch source
         uses: actions/checkout@v3
 
-      - name: Get WarehousePG version variables
+      - name: Get version variables
         id: vars
         run: |
           remote_repo='https://github.com/warehouse-pg/warehouse-pg.git'
@@ -86,7 +86,7 @@ jobs:
           cp uctags-2023.07.05-linux-x86_64/bin/* /usr/bin/
           which ctags
 
-      - name: Download WarehousePG source code
+      - name: Download source code
         uses: actions/checkout@v3
         with:
           repository: ${{ matrix.repo }}
@@ -99,11 +99,10 @@ jobs:
           yum install -y epel-release
           yum install -y abi-dumper
 
-      - name: Build WarehousePG
+      - name: Build
         run: |
-          yum install -y python2-devel
-          [ ! -f /usr/bin/python ] && alternatives --set python /usr/bin/python2
-
+          ## TODO: Since abi-dumper requires debug info and it's hard to inject CFLAGS via the release
+          ## script, we have to manually configure it here. Probably we can improve it in future.
           pushd gpdb_src
           ## Actually we should build a xerces-c with C++98 and link it instead
           ## of the system package, but for ABI comparison, simply go other way.

@@ -1,4 +1,4 @@
-name: WHPG CI
+name: WarehousePG CI
 
 # =============================================================================
 # Configuration: EL versions for each WHPG major version
@@ -12,8 +12,10 @@ env:
 
 run-name: >-
   ${{ github.event_name == 'workflow_dispatch'
-      && format('[7x] Manual: {0} on {1}', inputs.test_type == 'all' && 'all tests' || inputs.test_type, inputs.el_version == 'all' && 'all EL versions' || format('el{0}', inputs.el_version))
-      || format('[7x] {0} on {1}', github.event_name, github.ref_name) }}
+      && format('Manual: {0} on {1}', inputs.test_type == 'all' && 'all tests' || inputs.test_type, inputs.el_version == 'all' && 'all EL versions' || format('EL{0}', inputs.el_version))
+      || github.event_name == 'pull_request'
+      && format('PR #{0}: {1}', github.event.pull_request.number, github.event.pull_request.title)
+      || format('Push: {0}', github.ref_name) }}
 
 on:
   workflow_dispatch:
@@ -142,7 +144,7 @@ jobs:
       - name: Install required packages
         run: |
           # All build and CI dependencies are pre-installed in the container image
-          # (see dockerfiles/Dockerfile.rh*). Only WHPG 6 needs additional packages.
+          # (see dockerfiles/Dockerfile.el*). Only WHPG 6 needs additional packages.
           if [[ "${WHPG_MAJORVERSION}" == "6" ]]; then
             yum install -y --setopt=keepcache=1 python2-devel
           else
@@ -323,7 +325,7 @@ jobs:
       - name: Install build dependencies
         run: |
           # All build and CI dependencies are pre-installed in the container image
-          # (see dockerfiles/Dockerfile.rh*). Only WHPG 6 needs additional packages.
+          # (see dockerfiles/Dockerfile.el*). Only WHPG 6 needs additional packages.
           if [[ "${WHPG_MAJORVERSION}" == "6" ]]; then
             yum install -y --setopt=keepcache=1 python2-devel
           fi
