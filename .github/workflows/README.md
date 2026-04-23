@@ -164,3 +164,34 @@ The image is automatically selected based on detected WHPG version and matrix EL
 WHPG version is detected from git tags using `git describe --tags --abbrev=0`. The major version (first number before the dot) determines which EL versions to test.
 
 Example: Tag `7.2.1` → WHPG major version `7` → Uses `WHPG7_EL_VERSIONS`
+
+## WHPG 6 Configuration
+
+### Dual Python Version Support
+
+The workflow now supports building WHPG 6 with dual Python versions:
+
+**Build with Python 2:**
+- Python 2 is configured for the initial build to support PyGreSQL 4.0 (Python 2-only library)
+- This ensures successful compilation of all dependencies including xerces-c
+- Step: `Setup Python 2 for initial build` sets `alternatives --set python /usr/bin/python2`
+
+**PL/Python Rebuild with Python 3:**
+- Immediately after `make install`, PL/Python is reconfigured and rebuilt with Python 3 (`PYTHON=/usr/bin/python3`)
+- This step: `Rebuild PL/Python with Python 3` provides dual Python support in the final installation
+- Reconfigures the entire build system with Python 3, then cleans and rebuilds only the PL/Python module
+
+**Demo Cluster Creation with Python 2:**
+- Demo cluster is created with Python 2 (default from initial setup)
+- Ensures compatibility with Python 2 cluster creation scripts
+
+**Installcheck Tests with Python 3:**
+- After demo cluster creation, Python 3 is activated via `alternatives --set python /usr/bin/python3`
+- Installcheck tests run with Python 3 environment
+- Tests the new Python 3 PL/Python module
+
+**New Steps Added:**
+- `Build Xerces with Python 2 (WHPG 6 only)` - Builds xerces-c 3.1 using Python 2 (required for WHPG 6)
+- `Setup Python 2 for initial build` - Sets `alternatives --set python /usr/bin/python2`
+- `Rebuild PL/Python with Python 3` - Reconfigures with Python 3 and rebuilds PL/Python module
+- `Set up Python 3 for plpython test cases` - Switches to Python 3 before running installcheck tests

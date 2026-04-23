@@ -100,7 +100,7 @@ jobs:
       matrix:
         el_version: ${{ fromJson(needs.detect-config.outputs.el_versions) }}
     container:
-      image: ghcr.io/warehouse-pg/whpg${{ needs.detect-config.outputs.whpg_major }}-${{ format('rocky{0}', matrix.el_version) }}-build
+      image: ghcr.io/warehouse-pg/whpg7-${{ format('rocky{0}', matrix.el_version) }}-build
       options: --privileged
     env:
       WHPG_MAJORVERSION: ${{ needs.detect-config.outputs.whpg_major }}
@@ -146,6 +146,8 @@ jobs:
           # All build and CI dependencies are pre-installed in the container image
           # (see dockerfiles/Dockerfile.el*). Only WHPG 6 needs additional packages.
           if [[ "${WHPG_MAJORVERSION}" == "6" ]]; then
+            # Removing xerces-c as we need xerces 3.1
+            yum remove -y xerces-c xerces-c-devel
             yum install -y --setopt=keepcache=1 python2-devel
           else
             if [[ ! -e /usr/bin/pytest && -e /usr/bin/pytest-3 ]]; then
@@ -159,14 +161,30 @@ jobs:
           ccache --set-config=compression=true
           ccache --zero-stats
 
-      # Note: --with-quicklz, --enable-mapreduce, and --with-pythonsrc-ext are recognized
+      - name: Build Xerces with Python 2 (WHPG 6 only)
+        if: ${{ env.WHPG_MAJORVERSION == '6' }}
+        run: |
+            mkdir -p xerces_patch/concourse
+            cp -r ${WHPG_SRC}/src/backend/gporca/concourse/xerces-c xerces_patch/concourse
+            /usr/bin/python2 xerces_patch/concourse/xerces-c/build_xerces.py --output_dir="/usr/local"
+            rm -rf build xerces_patch
+            ln -s /usr/local/lib/libxerces-c-3.1.so /usr/lib64/libxerces-c-3.1.so
+            ldconfig
+
+      - name: Set up Python 2 for initial build (WHPG 6 only)
+        if: ${{ env.WHPG_MAJORVERSION == '6' }}
+        run: |
+          alternatives --set python /usr/bin/python2
+          python --version
+
+      # Note: --enable-mapreduce and --with-pythonsrc-ext are recognized
       # only in whpg6. They produce "unrecognized options" warnings in whpg7 but don't
       # fail the build. Kept for compatibility with both versions using a single workflow.
       - name: Configure
         run: |
           CC='ccache gcc -m64' \
           CFLAGS='-O2 -g3' LDFLAGS='-Wl,--enable-new-dtags -Wl,--export-dynamic' \
-          ./configure --with-quicklz --disable-gpperfmon --with-gssapi --enable-mapreduce --enable-orafce --enable-ic-proxy \
+          ./configure --disable-gpperfmon --with-gssapi --enable-mapreduce --enable-orafce --enable-ic-proxy \
                       --enable-orca --with-libxml --with-pythonsrc-ext --with-uuid=e2fs --with-pgport=5432 --enable-tap-tests \
                       --enable-debug-extensions --with-perl --with-python --with-openssl --with-pam --with-ldap --with-includes="" \
                       --with-libraries="" --disable-rpath \
@@ -184,16 +202,35 @@ jobs:
         id: install
         run: make install -j$(nproc)
 
+      - name: Rebuild PL/Python with Python 3 (WHPG 6 only)
+        if: ${{ env.WHPG_MAJORVERSION == '6' }}
+        run: |
+          PYTHON=/usr/bin/python3 \
+          CC='ccache gcc -m64' \
+          CFLAGS='-O2 -g3' LDFLAGS='-Wl,--enable-new-dtags -Wl,--export-dynamic ' \
+          ./configure --disable-gpperfmon --with-gssapi --enable-mapreduce --enable-orafce --enable-ic-proxy \
+                      --enable-orca --with-libxml --with-pythonsrc-ext --with-uuid=e2fs --with-pgport=5432 --enable-tap-tests \
+                      --enable-debug-extensions --with-perl --with-python --with-openssl --with-pam --with-ldap --with-includes="" \
+                      --with-libraries="" \
+                      --prefix=/usr/local/greenplum-db-devel \
+                      --mandir=/usr/local/greenplum-db-devel/man
+
+          make clean -C src/pl/plpython
+          make -j$(nproc) install -C src/pl/plpython
+
       - name: Setup gpadmin user
         run: |
           # Create symlinks for easier navigation
           ln -s . gpdb_src                          # For concourse scripts compatibility
           ln -s "${WHPG_SRC}" /workspace            # Easy to remember path
           ln -s "${WHPG_SRC}" /home/gpadmin/gpdb_src  # Accessible from gpadmin home
-          chown -h gpadmin:gpadmin /workspace /home/gpadmin/gpdb_src
+          # We delete the ggpadmin user for WHPG 6 compatibility as the setup script doesn't handle existing users.
+          # The userdel command is harmless in WHPG 7 as well since the setup script will recreate the user if it doesn't exist.
+          userdel gpadmin 2>/dev/null || true
 
           export TEST_OS=centos
           ./concourse/scripts/setup_gpadmin_user.bash
+          chown -h gpadmin:gpadmin /workspace /home/gpadmin/gpdb_src
           chown -R gpadmin:gpadmin /usr/local/greenplum-db-devel
           chown -R gpadmin:gpadmin "${WHPG_SRC}"
 
@@ -207,6 +244,12 @@ jobs:
           source concourse/scripts/common.bash
           export WITH_MIRRORS=false
           make_cluster
+
+      - name: Set up Python 3 for plpython test cases (WHPG 6 only)
+        if: ${{ env.WHPG_MAJORVERSION == '6' }}
+        run: |
+          alternatives --set python /usr/bin/python3
+          python --version
 
       - name: Run installcheck tests
         id: tests
@@ -286,7 +329,7 @@ jobs:
       matrix:
         el_version: ${{ fromJson(needs.detect-config.outputs.el_versions) }}
     container:
-      image: ghcr.io/warehouse-pg/whpg${{ needs.detect-config.outputs.whpg_major }}-${{ format('rocky{0}', matrix.el_version) }}-build
+      image: ghcr.io/warehouse-pg/whpg7-${{ format('rocky{0}', matrix.el_version) }}-build
       options: --privileged
     env:
       WHPG_MAJORVERSION: ${{ needs.detect-config.outputs.whpg_major }}
@@ -327,7 +370,9 @@ jobs:
           # All build and CI dependencies are pre-installed in the container image
           # (see dockerfiles/Dockerfile.el*). Only WHPG 6 needs additional packages.
           if [[ "${WHPG_MAJORVERSION}" == "6" ]]; then
+            yum remove -y xerces-c xerces-c-devel
             yum install -y --setopt=keepcache=1 python2-devel
+            alternatives --set python /usr/bin/python2
           fi
 
       - name: Configure ccache
