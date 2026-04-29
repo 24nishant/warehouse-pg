@@ -826,7 +826,7 @@ SELECT a,
  GROUP BY a;
 
 -----------------------------------------------------------------------------
--- Test 2 - with selective predicate + index to encourage a bitmap-scan emitter.
+-- Test 2 - with selective predicate + index to encourage a dynamic scan.
 -----------------------------------------------------------------------------
 EXPLAIN (COSTS OFF)
 SELECT a,
