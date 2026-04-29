@@ -3605,13 +3605,13 @@ CREATE TABLE sales (
   sale_amt   numeric(18,3)
 ) DISTRIBUTED BY (sale_key);
 INSERT INTO sales (sale_date, sale_key, cust_no, sale_amt)
-SELECT 
+SELECT
     '2026-04-01'::date + ((c + r) % (c % 7 + 1)) AS sale_date,
     'KEY-' || i AS sale_key,
     'C' || lpad((c + 1)::text, 4, '0') AS cust_no,
     ((c % 20 + 1) * 1000)::numeric(18,3) AS sale_amt
 FROM (
-    SELECT 
+    SELECT
         i,
         (i - 1) % 1000 AS c,
         (i - 1) / 1000 AS r
@@ -3619,11 +3619,11 @@ FROM (
 ) sub;
 EXPLAIN (COSTS OFF, VERBOSE)
 SELECT count(*) FROM (
-  SELECT cust_no, sum(sale_amt), count(distinct sale_date) 
-  FROM sales GROUP BY cust_no 
+  SELECT cust_no, sum(sale_amt), count(distinct sale_date)
+  FROM sales GROUP BY cust_no
   HAVING sum(sale_amt) >= 100000 AND count(distinct sale_date) >= 5
 )as sub;
-                                                            QUERY PLAN                                                            
+                                                            QUERY PLAN
 ----------------------------------------------------------------------------------------------------------------------------------
  Finalize Aggregate
    Output: count(*)
@@ -3649,11 +3649,11 @@ SELECT count(*) FROM (
 
 -- Without this patch, this SQL will output 78, which is not correct
 SELECT count(*) FROM (
-  SELECT cust_no, sum(sale_amt), count(distinct sale_date) 
-  FROM sales GROUP BY cust_no 
+  SELECT cust_no, sum(sale_amt), count(distinct sale_date)
+  FROM sales GROUP BY cust_no
   HAVING sum(sale_amt) >= 100000 AND count(distinct sale_date) >= 5
 )as sub;
- count 
+ count
 -------
    236
 (1 row)
@@ -3662,11 +3662,11 @@ SELECT count(*) FROM (
 SET optimizer_enable_multiple_distinct_aggs=on;
 EXPLAIN (COSTS OFF, VERBOSE)
 SELECT count(*) FROM (
-  SELECT cust_no, sum(distinct sale_amt), count(distinct sale_date) 
-  FROM sales GROUP BY cust_no 
+  SELECT cust_no, sum(distinct sale_amt), count(distinct sale_date)
+  FROM sales GROUP BY cust_no
   HAVING sum(sale_amt) >= 100000 AND count(distinct sale_date) >= 5
 )as sub;
-                                                            QUERY PLAN                                                            
+                                                            QUERY PLAN
 ----------------------------------------------------------------------------------------------------------------------------------
  Finalize Aggregate
    Output: count(*)
@@ -3695,9 +3695,755 @@ SELECT count(*) FROM (
   FROM sales GROUP BY cust_no
   HAVING sum(sale_amt) >= 100000 AND count(distinct sale_date) >= 5
 )as sub;
- count 
+ count
 -------
    236
 (1 row)
 
 DROP TABLE sales;
+-----------------------------------------------------------------------------
+-- Tests for multiple distinct-qualified aggregates
+-----------------------------------------------------------------------------
+CREATE SCHEMA IF NOT EXISTS schema_mdqa;
+SET search_path = schema_mdqa, public;
+SET optimizer_enable_multiple_distinct_aggs = on;
+-----------------------------------------------------------------------------
+-- Setup: two partitioned tables, one heap table.
+-----------------------------------------------------------------------------
+-- Partitioned, distributed by group-by key.
+CREATE TABLE mdqa_part(
+  a int,    -- group-by key + distribution key
+  b int,    -- DISTINCT arg
+  c int,    -- DISTINCT arg
+  d int     -- unused unless explicitly referenced
+)
+DISTRIBUTED BY (a)
+PARTITION BY RANGE(a) (
+  START (0) END (100) EVERY (50),
+  DEFAULT PARTITION other
+);
+INSERT INTO mdqa_part SELECT i, i%5, i%3, i%7 FROM generate_series(1, 100) i;
+CREATE INDEX mdqa_part_b_idx ON mdqa_part(b);
+ANALYZE mdqa_part;
+-- Partitioned, distributed by a column NOT used in the query.
+CREATE TABLE mdqa_dist_unused(
+  a int,        -- group-by key
+  b int,
+  c int,
+  dist_col int  -- distribution key, never referenced in any test query
+)
+DISTRIBUTED BY (dist_col)
+PARTITION BY RANGE(a) (
+  START (0) END (100) EVERY (50),
+  DEFAULT PARTITION other
+);
+INSERT INTO mdqa_dist_unused SELECT i, i%5, i%3, i%11
+  FROM generate_series(1, 100) i;
+ANALYZE mdqa_dist_unused;
+-- Non-partitioned control. Same shape, heap table.
+CREATE TABLE mdqa_heap(a int, b int, c int, d int) DISTRIBUTED BY (a);
+INSERT INTO mdqa_heap SELECT i, i%5, i%3, i%7 FROM generate_series(1, 100) i;
+ANALYZE mdqa_heap;
+-- Based on crashing query
+CREATE TABLE orders(
+  order_date  date,
+  account_id  int,
+  region      text,
+  order_id    int,
+  amount      numeric(15,2)
+)
+DISTRIBUTED BY (account_id)
+PARTITION BY RANGE(order_date) (
+  START ('2026-04-01'::date) END ('2026-04-08'::date) EVERY ('1 day'::interval),
+  DEFAULT PARTITION other
+);
+INSERT INTO orders
+  SELECT ('2026-04-01'::date + ((i % 7) || ' days')::interval)::date,
+         i % 20,
+         CASE WHEN i % 3 = 0 THEN 'NORTH' ELSE 'SOUTH' END,
+         i,
+         (i * 1000)::numeric(15,2)
+  FROM generate_series(1, 200) i;
+ANALYZE orders;
+-----------------------------------------------------------------------------
+-- Test 1 - minimal MDQA on partitioned table.
+-----------------------------------------------------------------------------
+EXPLAIN (COSTS OFF)
+SELECT a,
+       count(DISTINCT b) AS cnt_b,
+       count(DISTINCT c) AS cnt_c
+  FROM mdqa_part
+ GROUP BY a;
+                                                   QUERY PLAN
+----------------------------------------------------------------------------------------------------------------
+ Finalize HashAggregate
+   Group Key: mdqa_part_1_prt_2.a
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial HashAggregate
+               Group Key: mdqa_part_1_prt_2.a
+               ->  HashAggregate
+                     Group Key: (AggExprId), mdqa_part_1_prt_2.b, mdqa_part_1_prt_2.c, mdqa_part_1_prt_2.a
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: mdqa_part_1_prt_2.a, mdqa_part_1_prt_2.b, mdqa_part_1_prt_2.c, (AggExprId)
+                           ->  TupleSplit
+                                 Split by Col: (mdqa_part_1_prt_2.b), (mdqa_part_1_prt_2.c)
+                                 Group Key: mdqa_part_1_prt_2.a
+                                 ->  Append
+                                       ->  Seq Scan on mdqa_part_1_prt_2
+                                       ->  Seq Scan on mdqa_part_1_prt_3
+                                       ->  Seq Scan on mdqa_part_1_prt_other
+ Optimizer: Postgres-based planner
+(17 rows)
+
+-----------------------------------------------------------------------------
+-- Test 2 - with selective predicate + index to encourage a dynamic scan.
+-----------------------------------------------------------------------------
+EXPLAIN (COSTS OFF)
+SELECT a,
+       count(DISTINCT b) AS cnt_b,
+       count(DISTINCT c) AS cnt_c
+  FROM mdqa_part
+ WHERE b BETWEEN 0 AND 2
+ GROUP BY a;
+                                                   QUERY PLAN
+----------------------------------------------------------------------------------------------------------------
+ Finalize HashAggregate
+   Group Key: mdqa_part_1_prt_2.a
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial HashAggregate
+               Group Key: mdqa_part_1_prt_2.a
+               ->  HashAggregate
+                     Group Key: (AggExprId), mdqa_part_1_prt_2.b, mdqa_part_1_prt_2.c, mdqa_part_1_prt_2.a
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: mdqa_part_1_prt_2.a, mdqa_part_1_prt_2.b, mdqa_part_1_prt_2.c, (AggExprId)
+                           ->  TupleSplit
+                                 Split by Col: (mdqa_part_1_prt_2.b), (mdqa_part_1_prt_2.c)
+                                 Group Key: mdqa_part_1_prt_2.a
+                                 ->  Append
+                                       ->  Seq Scan on mdqa_part_1_prt_2
+                                             Filter: ((b >= 0) AND (b <= 2))
+                                       ->  Seq Scan on mdqa_part_1_prt_3
+                                             Filter: ((b >= 0) AND (b <= 2))
+                                       ->  Seq Scan on mdqa_part_1_prt_other
+                                             Filter: ((b >= 0) AND (b <= 2))
+ Optimizer: Postgres-based planner
+(20 rows)
+
+-----------------------------------------------------------------------------
+-- Test 3 - system column (ctid) as a DISTINCT argument.
+-- Validates the fix correctly INCLUDES referenced system columns in the
+-- CTEproducer
+-----------------------------------------------------------------------------
+EXPLAIN (COSTS OFF)
+SELECT a,
+       count(DISTINCT ctid) AS distinct_rows,
+       count(DISTINCT b)    AS distinct_b
+  FROM mdqa_part
+ GROUP BY a;
+                                                    QUERY PLAN
+-------------------------------------------------------------------------------------------------------------------
+ Finalize HashAggregate
+   Group Key: mdqa_part_1_prt_2.a
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial HashAggregate
+               Group Key: mdqa_part_1_prt_2.a
+               ->  HashAggregate
+                     Group Key: (AggExprId), mdqa_part_1_prt_2.ctid, mdqa_part_1_prt_2.b, mdqa_part_1_prt_2.a
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: mdqa_part_1_prt_2.a, mdqa_part_1_prt_2.ctid, mdqa_part_1_prt_2.b, (AggExprId)
+                           ->  TupleSplit
+                                 Split by Col: (mdqa_part_1_prt_2.ctid), (mdqa_part_1_prt_2.b)
+                                 Group Key: mdqa_part_1_prt_2.a
+                                 ->  Append
+                                       ->  Seq Scan on mdqa_part_1_prt_2
+                                       ->  Seq Scan on mdqa_part_1_prt_3
+                                       ->  Seq Scan on mdqa_part_1_prt_other
+ Optimizer: Postgres-based planner
+(17 rows)
+
+-----------------------------------------------------------------------------
+-- Test 4 - group-by key referenced ONLY in GROUP BY clause —
+-----------------------------------------------------------------------------
+EXPLAIN (COSTS OFF)
+SELECT count(DISTINCT b),
+       count(DISTINCT c)
+  FROM mdqa_part
+ GROUP BY a;
+                                                   QUERY PLAN
+----------------------------------------------------------------------------------------------------------------
+ Finalize HashAggregate
+   Group Key: mdqa_part_1_prt_2.a
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial HashAggregate
+               Group Key: mdqa_part_1_prt_2.a
+               ->  HashAggregate
+                     Group Key: (AggExprId), mdqa_part_1_prt_2.b, mdqa_part_1_prt_2.c, mdqa_part_1_prt_2.a
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: mdqa_part_1_prt_2.a, mdqa_part_1_prt_2.b, mdqa_part_1_prt_2.c, (AggExprId)
+                           ->  TupleSplit
+                                 Split by Col: (mdqa_part_1_prt_2.b), (mdqa_part_1_prt_2.c)
+                                 Group Key: mdqa_part_1_prt_2.a
+                                 ->  Append
+                                       ->  Seq Scan on mdqa_part_1_prt_2
+                                       ->  Seq Scan on mdqa_part_1_prt_3
+                                       ->  Seq Scan on mdqa_part_1_prt_other
+ Optimizer: Postgres-based planner
+(17 rows)
+
+-----------------------------------------------------------------------------
+-- Test 5 - distribution key NOT referenced anywhere in the query.
+-----------------------------------------------------------------------------
+EXPLAIN (COSTS OFF)
+SELECT a,
+       count(DISTINCT b),
+       count(DISTINCT c)
+  FROM mdqa_dist_unused
+ GROUP BY a;
+                                                             QUERY PLAN
+-------------------------------------------------------------------------------------------------------------------------------------
+ Finalize HashAggregate
+   Group Key: mdqa_dist_unused_1_prt_2.a
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial HashAggregate
+               Group Key: mdqa_dist_unused_1_prt_2.a
+               ->  HashAggregate
+                     Group Key: (AggExprId), mdqa_dist_unused_1_prt_2.b, mdqa_dist_unused_1_prt_2.c, mdqa_dist_unused_1_prt_2.a
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: mdqa_dist_unused_1_prt_2.a, mdqa_dist_unused_1_prt_2.b, mdqa_dist_unused_1_prt_2.c, (AggExprId)
+                           ->  TupleSplit
+                                 Split by Col: (mdqa_dist_unused_1_prt_2.b), (mdqa_dist_unused_1_prt_2.c)
+                                 Group Key: mdqa_dist_unused_1_prt_2.a
+                                 ->  Append
+                                       ->  Seq Scan on mdqa_dist_unused_1_prt_2
+                                       ->  Seq Scan on mdqa_dist_unused_1_prt_3
+                                       ->  Seq Scan on mdqa_dist_unused_1_prt_other
+ Optimizer: Postgres-based planner
+(17 rows)
+
+-----------------------------------------------------------------------------
+-- Test 6 - MDQA with NO GROUP BY (single global aggregation).
+-----------------------------------------------------------------------------
+EXPLAIN (COSTS OFF)
+SELECT count(DISTINCT b),
+       count(DISTINCT c)
+  FROM mdqa_part;
+                                      QUERY PLAN
+--------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                     Hash Key: mdqa_part_1_prt_2.b, mdqa_part_1_prt_2.c, (AggExprId)
+                     ->  TupleSplit
+                           Split by Col: (mdqa_part_1_prt_2.b), (mdqa_part_1_prt_2.c)
+                           ->  Append
+                                 ->  Seq Scan on mdqa_part_1_prt_2
+                                 ->  Seq Scan on mdqa_part_1_prt_3
+                                 ->  Seq Scan on mdqa_part_1_prt_other
+ Optimizer: Postgres-based planner
+(12 rows)
+
+-----------------------------------------------------------------------------
+-- Test 7 - mix of agg functions
+-----------------------------------------------------------------------------
+EXPLAIN (COSTS OFF)
+SELECT a,
+       count(DISTINCT b) AS cnt_b,
+       sum(DISTINCT c)   AS sum_c,
+       avg(DISTINCT b)   AS avg_b,
+       min(DISTINCT c)   AS min_c,
+       max(DISTINCT d)   AS max_d,
+       sum(d)            AS plain_sum_d
+  FROM mdqa_part
+ GROUP BY a
+ ORDER BY a;
+                                                                QUERY PLAN
+-------------------------------------------------------------------------------------------------------------------------------------------
+ Sort
+   Sort Key: mdqa_part_1_prt_2.a
+   ->  Finalize HashAggregate
+         Group Key: mdqa_part_1_prt_2.a
+         ->  Gather Motion 3:1  (slice1; segments: 3)
+               ->  Partial HashAggregate
+                     Group Key: mdqa_part_1_prt_2.a
+                     ->  Partial HashAggregate
+                           Group Key: (AggExprId), mdqa_part_1_prt_2.b, mdqa_part_1_prt_2.c, mdqa_part_1_prt_2.d, mdqa_part_1_prt_2.a
+                           ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                 Hash Key: mdqa_part_1_prt_2.a, mdqa_part_1_prt_2.b, mdqa_part_1_prt_2.c, mdqa_part_1_prt_2.d, (AggExprId)
+                                 ->  TupleSplit
+                                       Split by Col: (mdqa_part_1_prt_2.b), (mdqa_part_1_prt_2.c), (mdqa_part_1_prt_2.d)
+                                       Group Key: mdqa_part_1_prt_2.a
+                                       ->  Append
+                                             ->  Seq Scan on mdqa_part_1_prt_2
+                                             ->  Seq Scan on mdqa_part_1_prt_3
+                                             ->  Seq Scan on mdqa_part_1_prt_other
+ Optimizer: Postgres-based planner
+(19 rows)
+
+-----------------------------------------------------------------------------
+-- Test 8 - MDQA over an inline view (subquery in FROM).
+-----------------------------------------------------------------------------
+EXPLAIN (COSTS OFF)
+SELECT a,
+       count(DISTINCT b) AS cnt_b,
+       count(DISTINCT c) AS cnt_c
+  FROM (SELECT a, b, c, d
+          FROM mdqa_part
+         WHERE d > 0) sub
+ GROUP BY a
+ ORDER BY a;
+                                                      QUERY PLAN
+----------------------------------------------------------------------------------------------------------------------
+ Sort
+   Sort Key: mdqa_part_1_prt_2.a
+   ->  Finalize HashAggregate
+         Group Key: mdqa_part_1_prt_2.a
+         ->  Gather Motion 3:1  (slice1; segments: 3)
+               ->  Partial HashAggregate
+                     Group Key: mdqa_part_1_prt_2.a
+                     ->  HashAggregate
+                           Group Key: (AggExprId), mdqa_part_1_prt_2.b, mdqa_part_1_prt_2.c, mdqa_part_1_prt_2.a
+                           ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                 Hash Key: mdqa_part_1_prt_2.a, mdqa_part_1_prt_2.b, mdqa_part_1_prt_2.c, (AggExprId)
+                                 ->  TupleSplit
+                                       Split by Col: (mdqa_part_1_prt_2.b), (mdqa_part_1_prt_2.c)
+                                       Group Key: mdqa_part_1_prt_2.a
+                                       ->  Append
+                                             ->  Seq Scan on mdqa_part_1_prt_2
+                                                   Filter: (d > 0)
+                                             ->  Seq Scan on mdqa_part_1_prt_3
+                                                   Filter: (d > 0)
+                                             ->  Seq Scan on mdqa_part_1_prt_other
+                                                   Filter: (d > 0)
+ Optimizer: Postgres-based planner
+(22 rows)
+
+-----------------------------------------------------------------------------
+-- Test 9 - NON-partitioned control for Test 1
+-----------------------------------------------------------------------------
+EXPLAIN (COSTS OFF)
+SELECT a,
+       count(DISTINCT b) AS cnt_b,
+       count(DISTINCT c) AS cnt_c
+  FROM mdqa_heap
+ GROUP BY a;
+                               QUERY PLAN
+------------------------------------------------------------------------
+ Finalize HashAggregate
+   Group Key: a
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial HashAggregate
+               Group Key: a
+               ->  HashAggregate
+                     Group Key: (AggExprId), b, c, a
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: a, b, c, (AggExprId)
+                           ->  TupleSplit
+                                 Split by Col: (b), (c)
+                                 Group Key: a
+                                 ->  Seq Scan on mdqa_heap
+ Optimizer: Postgres-based planner
+(14 rows)
+
+-----------------------------------------------------------------------------
+-- Test 10 - no GROUP BY, heap table.
+-- Confirms the fix doesn't effect the empty-keys / heap path either.
+-----------------------------------------------------------------------------
+EXPLAIN (COSTS OFF)
+SELECT count(DISTINCT b),
+       count(DISTINCT c)
+  FROM mdqa_heap;
+                            QUERY PLAN
+------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                     Hash Key: b, c, (AggExprId)
+                     ->  TupleSplit
+                           Split by Col: (b), (c)
+                           ->  Seq Scan on mdqa_heap
+ Optimizer: Postgres-based planner
+(9 rows)
+
+-----------------------------------------------------------------------------
+-- Test 11 - shape-equivalent reproducer of the crashing query
+-----------------------------------------------------------------------------
+EXPLAIN (COSTS OFF)
+WITH qualified_accounts AS (
+    SELECT o.account_id AS account_id
+      FROM orders o
+     WHERE o.order_date BETWEEN '2026-04-01'::date AND '2026-04-07'::date
+       AND o.region = 'NORTH'
+     GROUP BY o.account_id
+    HAVING (sum(o.amount) >= 100000.0
+            AND count(DISTINCT o.order_date) >= 5.0)
+)
+SELECT o1.account_id,
+       sum(o1.amount)                AS amount_sum,
+       count(DISTINCT o1.order_date) AS date_cnt,
+       count(DISTINCT o1.account_id) AS account_cnt,
+       count(DISTINCT o1.order_id)   AS order_cnt
+  FROM orders o1
+       JOIN qualified_accounts qa ON (o1.account_id = qa.account_id)
+ WHERE o1.order_date BETWEEN '2026-04-01'::date AND '2026-04-07'::date
+   AND o1.region = 'NORTH'
+ GROUP BY o1.account_id;
+                                                                                      QUERY PLAN
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Finalize HashAggregate
+   Group Key: o1.account_id
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial HashAggregate
+               Group Key: o1.account_id
+               ->  Partial HashAggregate
+                     Group Key: (AggExprId), o1.order_date, o1.order_id, o1.account_id
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: o1.account_id, o1.order_date, o1.order_id, (AggExprId)
+                           ->  TupleSplit
+                                 Split by Col: (o1.order_date), (o1.account_id), (o1.order_id)
+                                 Group Key: o1.account_id
+                                 ->  Hash Join
+                                       Hash Cond: (o1.account_id = o.account_id)
+                                       ->  Append
+                                             ->  Seq Scan on orders_1_prt_2 o1
+                                                   Filter: ((order_date >= '04-01-2026'::date) AND (order_date <= '04-07-2026'::date) AND (region = 'NORTH'::text))
+                                             ->  Seq Scan on orders_1_prt_3 o1_1
+                                                   Filter: ((order_date >= '04-01-2026'::date) AND (order_date <= '04-07-2026'::date) AND (region = 'NORTH'::text))
+                                             ->  Seq Scan on orders_1_prt_4 o1_2
+                                                   Filter: ((order_date >= '04-01-2026'::date) AND (order_date <= '04-07-2026'::date) AND (region = 'NORTH'::text))
+                                             ->  Seq Scan on orders_1_prt_5 o1_3
+                                                   Filter: ((order_date >= '04-01-2026'::date) AND (order_date <= '04-07-2026'::date) AND (region = 'NORTH'::text))
+                                             ->  Seq Scan on orders_1_prt_6 o1_4
+                                                   Filter: ((order_date >= '04-01-2026'::date) AND (order_date <= '04-07-2026'::date) AND (region = 'NORTH'::text))
+                                             ->  Seq Scan on orders_1_prt_7 o1_5
+                                                   Filter: ((order_date >= '04-01-2026'::date) AND (order_date <= '04-07-2026'::date) AND (region = 'NORTH'::text))
+                                             ->  Seq Scan on orders_1_prt_8 o1_6
+                                                   Filter: ((order_date >= '04-01-2026'::date) AND (order_date <= '04-07-2026'::date) AND (region = 'NORTH'::text))
+                                       ->  Hash
+                                             ->  HashAggregate
+                                                   Group Key: o.account_id
+                                                   Filter: ((sum(o.amount) >= 100000.0) AND ((count(o.order_date))::numeric >= 5.0))
+                                                   ->  HashAggregate
+                                                         Group Key: o.account_id, o.order_date
+                                                         ->  Append
+                                                               ->  Seq Scan on orders_1_prt_2 o
+                                                                     Filter: ((order_date >= '04-01-2026'::date) AND (order_date <= '04-07-2026'::date) AND (region = 'NORTH'::text))
+                                                               ->  Seq Scan on orders_1_prt_3 o_1
+                                                                     Filter: ((order_date >= '04-01-2026'::date) AND (order_date <= '04-07-2026'::date) AND (region = 'NORTH'::text))
+                                                               ->  Seq Scan on orders_1_prt_4 o_2
+                                                                     Filter: ((order_date >= '04-01-2026'::date) AND (order_date <= '04-07-2026'::date) AND (region = 'NORTH'::text))
+                                                               ->  Seq Scan on orders_1_prt_5 o_3
+                                                                     Filter: ((order_date >= '04-01-2026'::date) AND (order_date <= '04-07-2026'::date) AND (region = 'NORTH'::text))
+                                                               ->  Seq Scan on orders_1_prt_6 o_4
+                                                                     Filter: ((order_date >= '04-01-2026'::date) AND (order_date <= '04-07-2026'::date) AND (region = 'NORTH'::text))
+                                                               ->  Seq Scan on orders_1_prt_7 o_5
+                                                                     Filter: ((order_date >= '04-01-2026'::date) AND (order_date <= '04-07-2026'::date) AND (region = 'NORTH'::text))
+                                                               ->  Seq Scan on orders_1_prt_8 o_6
+                                                                     Filter: ((order_date >= '04-01-2026'::date) AND (order_date <= '04-07-2026'::date) AND (region = 'NORTH'::text))
+ Optimizer: Postgres-based planner
+(51 rows)
+
+-----------------------------------------------------------------------------
+-- Test 12 - multi-column GROUP BY.
+-----------------------------------------------------------------------------
+EXPLAIN (COSTS OFF)
+SELECT a, b,
+       count(DISTINCT b) AS cnt_b,
+       count(DISTINCT c) AS cnt_c
+  FROM mdqa_part
+ GROUP BY a, b;
+                                                   QUERY PLAN
+----------------------------------------------------------------------------------------------------------------
+ Finalize HashAggregate
+   Group Key: mdqa_part_1_prt_2.a, mdqa_part_1_prt_2.b
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial HashAggregate
+               Group Key: mdqa_part_1_prt_2.a, mdqa_part_1_prt_2.b
+               ->  HashAggregate
+                     Group Key: (AggExprId), mdqa_part_1_prt_2.c, mdqa_part_1_prt_2.a, mdqa_part_1_prt_2.b
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: mdqa_part_1_prt_2.a, mdqa_part_1_prt_2.b, mdqa_part_1_prt_2.c, (AggExprId)
+                           ->  TupleSplit
+                                 Split by Col: (mdqa_part_1_prt_2.b), (mdqa_part_1_prt_2.c)
+                                 Group Key: mdqa_part_1_prt_2.a, mdqa_part_1_prt_2.b
+                                 ->  Append
+                                       ->  Seq Scan on mdqa_part_1_prt_2
+                                       ->  Seq Scan on mdqa_part_1_prt_3
+                                       ->  Seq Scan on mdqa_part_1_prt_other
+ Optimizer: Postgres-based planner
+(17 rows)
+
+-----------------------------------------------------------------------------
+-- Test 13 - DQAs referenced from HAVING clause, not SELECT list.
+-----------------------------------------------------------------------------
+EXPLAIN (COSTS OFF)
+SELECT a, sum(d) AS total
+  FROM mdqa_part
+ GROUP BY a
+HAVING count(DISTINCT b) > 1
+   AND count(DISTINCT c) > 1;
+                                                   QUERY PLAN
+----------------------------------------------------------------------------------------------------------------
+ Finalize HashAggregate
+   Group Key: mdqa_part_1_prt_2.a
+   Filter: ((count(mdqa_part_1_prt_2.b) > 1) AND (count(mdqa_part_1_prt_2.c) > 1))
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial HashAggregate
+               Group Key: mdqa_part_1_prt_2.a
+               ->  Partial HashAggregate
+                     Group Key: (AggExprId), mdqa_part_1_prt_2.b, mdqa_part_1_prt_2.c, mdqa_part_1_prt_2.a
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: mdqa_part_1_prt_2.a, mdqa_part_1_prt_2.b, mdqa_part_1_prt_2.c, (AggExprId)
+                           ->  TupleSplit
+                                 Split by Col: (mdqa_part_1_prt_2.b), (mdqa_part_1_prt_2.c)
+                                 Group Key: mdqa_part_1_prt_2.a
+                                 ->  Append
+                                       ->  Seq Scan on mdqa_part_1_prt_2
+                                       ->  Seq Scan on mdqa_part_1_prt_3
+                                       ->  Seq Scan on mdqa_part_1_prt_other
+ Optimizer: Postgres-based planner
+(18 rows)
+
+-----------------------------------------------------------------------------
+-- Test 14 - LIST-partitioned table (not RANGE).
+-----------------------------------------------------------------------------
+CREATE TABLE mdqa_list_part(a int, b int, c int, d int)
+DISTRIBUTED BY (a)
+PARTITION BY LIST(a) (
+  PARTITION p1 VALUES (1, 2, 3),
+  PARTITION p2 VALUES (4, 5, 6),
+  DEFAULT PARTITION other
+);
+INSERT INTO mdqa_list_part SELECT i, i%5, i%3, i%7
+  FROM generate_series(1, 30) i;
+ANALYZE mdqa_list_part;
+EXPLAIN (COSTS OFF)
+SELECT a,
+       count(DISTINCT b) AS cnt_b,
+       count(DISTINCT c) AS cnt_c
+  FROM mdqa_list_part
+ GROUP BY a;
+                                                            QUERY PLAN
+----------------------------------------------------------------------------------------------------------------------------------
+ Finalize HashAggregate
+   Group Key: mdqa_list_part_1_prt_p1.a
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial HashAggregate
+               Group Key: mdqa_list_part_1_prt_p1.a
+               ->  HashAggregate
+                     Group Key: (AggExprId), mdqa_list_part_1_prt_p1.b, mdqa_list_part_1_prt_p1.c, mdqa_list_part_1_prt_p1.a
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: mdqa_list_part_1_prt_p1.a, mdqa_list_part_1_prt_p1.b, mdqa_list_part_1_prt_p1.c, (AggExprId)
+                           ->  TupleSplit
+                                 Split by Col: (mdqa_list_part_1_prt_p1.b), (mdqa_list_part_1_prt_p1.c)
+                                 Group Key: mdqa_list_part_1_prt_p1.a
+                                 ->  Append
+                                       ->  Seq Scan on mdqa_list_part_1_prt_p1
+                                       ->  Seq Scan on mdqa_list_part_1_prt_p2
+                                       ->  Seq Scan on mdqa_list_part_1_prt_other
+ Optimizer: Postgres-based planner
+(17 rows)
+
+-----------------------------------------------------------------------------
+-- Test 15 - partition-eliminated query .
+-- Confirms the narrowed producer still works when only a
+-- subset of the partitions are reachable.
+-----------------------------------------------------------------------------
+EXPLAIN (COSTS OFF)
+SELECT a,
+       count(DISTINCT b) AS cnt_b,
+       count(DISTINCT c) AS cnt_c
+  FROM mdqa_part
+ WHERE a >= 0 AND a < 50    -- prunes the [50,100) and DEFAULT partitions
+ GROUP BY a;
+                                                   QUERY PLAN
+----------------------------------------------------------------------------------------------------------------
+ Finalize HashAggregate
+   Group Key: mdqa_part_1_prt_2.a
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial HashAggregate
+               Group Key: mdqa_part_1_prt_2.a
+               ->  HashAggregate
+                     Group Key: (AggExprId), mdqa_part_1_prt_2.b, mdqa_part_1_prt_2.c, mdqa_part_1_prt_2.a
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: mdqa_part_1_prt_2.a, mdqa_part_1_prt_2.b, mdqa_part_1_prt_2.c, (AggExprId)
+                           ->  TupleSplit
+                                 Split by Col: (mdqa_part_1_prt_2.b), (mdqa_part_1_prt_2.c)
+                                 Group Key: mdqa_part_1_prt_2.a
+                                 ->  Seq Scan on mdqa_part_1_prt_2
+                                       Filter: ((a >= 0) AND (a < 50))
+ Optimizer: Postgres-based planner
+(15 rows)
+
+-----------------------------------------------------------------------------
+-- Test 16 - NULL handling in DQA arguments on a partitioned table.
+-----------------------------------------------------------------------------
+INSERT INTO mdqa_part VALUES
+  (NULL, NULL, NULL, NULL),
+  (50,   NULL, 1,    NULL),
+  (51,   2,    NULL, 9);
+ANALYZE mdqa_part;
+EXPLAIN (COSTS OFF)
+SELECT a,
+       count(DISTINCT b) AS cnt_b,
+       count(DISTINCT c) AS cnt_c,
+       sum(DISTINCT b)   AS sum_b
+  FROM mdqa_part
+ GROUP BY a;
+                                                   QUERY PLAN
+----------------------------------------------------------------------------------------------------------------
+ Finalize HashAggregate
+   Group Key: mdqa_part_1_prt_2.a
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial HashAggregate
+               Group Key: mdqa_part_1_prt_2.a
+               ->  HashAggregate
+                     Group Key: (AggExprId), mdqa_part_1_prt_2.b, mdqa_part_1_prt_2.c, mdqa_part_1_prt_2.a
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: mdqa_part_1_prt_2.a, mdqa_part_1_prt_2.b, mdqa_part_1_prt_2.c, (AggExprId)
+                           ->  TupleSplit
+                                 Split by Col: (mdqa_part_1_prt_2.b), (mdqa_part_1_prt_2.c)
+                                 Group Key: mdqa_part_1_prt_2.a
+                                 ->  Append
+                                       ->  Seq Scan on mdqa_part_1_prt_2
+                                       ->  Seq Scan on mdqa_part_1_prt_3
+                                       ->  Seq Scan on mdqa_part_1_prt_other
+ Optimizer: Postgres-based planner
+(17 rows)
+
+-----------------------------------------------------------------------------
+-- Test 17 - DISTRIBUTED RANDOMLY + partitioned.
+-----------------------------------------------------------------------------
+CREATE TABLE mdqa_random_dist(a int, b int, c int, d int)
+DISTRIBUTED RANDOMLY
+PARTITION BY RANGE(a) (
+  START (0) END (100) EVERY (50),
+  DEFAULT PARTITION other
+);
+INSERT INTO mdqa_random_dist SELECT i, i%5, i%3, i%7
+  FROM generate_series(1, 100) i;
+ANALYZE mdqa_random_dist;
+EXPLAIN (COSTS OFF)
+SELECT a,
+       count(DISTINCT b) AS cnt_b,
+       count(DISTINCT c) AS cnt_c
+  FROM mdqa_random_dist
+ GROUP BY a;
+                                                             QUERY PLAN
+-------------------------------------------------------------------------------------------------------------------------------------
+ Finalize HashAggregate
+   Group Key: mdqa_random_dist_1_prt_2.a
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial HashAggregate
+               Group Key: mdqa_random_dist_1_prt_2.a
+               ->  HashAggregate
+                     Group Key: (AggExprId), mdqa_random_dist_1_prt_2.b, mdqa_random_dist_1_prt_2.c, mdqa_random_dist_1_prt_2.a
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: mdqa_random_dist_1_prt_2.a, mdqa_random_dist_1_prt_2.b, mdqa_random_dist_1_prt_2.c, (AggExprId)
+                           ->  TupleSplit
+                                 Split by Col: (mdqa_random_dist_1_prt_2.b), (mdqa_random_dist_1_prt_2.c)
+                                 Group Key: mdqa_random_dist_1_prt_2.a
+                                 ->  Append
+                                       ->  Seq Scan on mdqa_random_dist_1_prt_2
+                                       ->  Seq Scan on mdqa_random_dist_1_prt_3
+                                       ->  Seq Scan on mdqa_random_dist_1_prt_other
+ Optimizer: Postgres-based planner
+(17 rows)
+
+-----------------------------------------------------------------------------
+-- Test 18 - PRIMARY KEY on the group-by
+-- column, with an unused non-key column.
+-----------------------------------------------------------------------------
+CREATE TABLE mdqa_pk_grpkey(a int PRIMARY KEY, b int, c int, d int)
+DISTRIBUTED BY (a)
+PARTITION BY RANGE(a) (
+  START (0) END (100) EVERY (50),
+  DEFAULT PARTITION other
+);
+INSERT INTO mdqa_pk_grpkey SELECT i, i%5, i%3, i%7
+  FROM generate_series(1, 99) i;
+ANALYZE mdqa_pk_grpkey;
+EXPLAIN (COSTS OFF)
+SELECT a,
+       count(DISTINCT b) AS cnt_b,
+       count(DISTINCT c) AS cnt_c
+  FROM mdqa_pk_grpkey
+ GROUP BY a;
+                                                          QUERY PLAN
+-------------------------------------------------------------------------------------------------------------------------------
+ Finalize HashAggregate
+   Group Key: mdqa_pk_grpkey_1_prt_2.a
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial HashAggregate
+               Group Key: mdqa_pk_grpkey_1_prt_2.a
+               ->  HashAggregate
+                     Group Key: (AggExprId), mdqa_pk_grpkey_1_prt_2.b, mdqa_pk_grpkey_1_prt_2.c, mdqa_pk_grpkey_1_prt_2.a
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: mdqa_pk_grpkey_1_prt_2.a, mdqa_pk_grpkey_1_prt_2.b, mdqa_pk_grpkey_1_prt_2.c, (AggExprId)
+                           ->  TupleSplit
+                                 Split by Col: (mdqa_pk_grpkey_1_prt_2.b), (mdqa_pk_grpkey_1_prt_2.c)
+                                 Group Key: mdqa_pk_grpkey_1_prt_2.a
+                                 ->  Append
+                                       ->  Seq Scan on mdqa_pk_grpkey_1_prt_2
+                                       ->  Seq Scan on mdqa_pk_grpkey_1_prt_3
+                                       ->  Seq Scan on mdqa_pk_grpkey_1_prt_other
+ Optimizer: Postgres-based planner
+(17 rows)
+
+-----------------------------------------------------------------------------
+-- Test 19 - unused column is TEXT
+-----------------------------------------------------------------------------
+CREATE TABLE mdqa_text_col(a int, b int, c int, d text)
+DISTRIBUTED BY (a)
+PARTITION BY RANGE(a) (
+  START (0) END (100) EVERY (50),
+  DEFAULT PARTITION other
+);
+INSERT INTO mdqa_text_col
+  SELECT i, i%5, i%3, 'row-' || i FROM generate_series(1, 100) i;
+ANALYZE mdqa_text_col;
+EXPLAIN (COSTS OFF)
+SELECT a,
+       count(DISTINCT b) AS cnt_b,
+       count(DISTINCT c) AS cnt_c
+  FROM mdqa_text_col
+ GROUP BY a;
+                                                         QUERY PLAN
+----------------------------------------------------------------------------------------------------------------------------
+ Finalize HashAggregate
+   Group Key: mdqa_text_col_1_prt_2.a
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial HashAggregate
+               Group Key: mdqa_text_col_1_prt_2.a
+               ->  HashAggregate
+                     Group Key: (AggExprId), mdqa_text_col_1_prt_2.b, mdqa_text_col_1_prt_2.c, mdqa_text_col_1_prt_2.a
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: mdqa_text_col_1_prt_2.a, mdqa_text_col_1_prt_2.b, mdqa_text_col_1_prt_2.c, (AggExprId)
+                           ->  TupleSplit
+                                 Split by Col: (mdqa_text_col_1_prt_2.b), (mdqa_text_col_1_prt_2.c)
+                                 Group Key: mdqa_text_col_1_prt_2.a
+                                 ->  Append
+                                       ->  Seq Scan on mdqa_text_col_1_prt_2
+                                       ->  Seq Scan on mdqa_text_col_1_prt_3
+                                       ->  Seq Scan on mdqa_text_col_1_prt_other
+ Optimizer: Postgres-based planner
+(17 rows)
+
+-----------------------------------------------------------------------------
+-- Cleanup
+-----------------------------------------------------------------------------
+DROP TABLE mdqa_part;
+DROP TABLE mdqa_dist_unused;
+DROP TABLE mdqa_heap;
+DROP TABLE mdqa_list_part;
+DROP TABLE mdqa_random_dist;
+DROP TABLE mdqa_pk_grpkey;
+DROP TABLE mdqa_text_col;
+DROP TABLE orders;
+DROP SCHEMA schema_mdqa;
+RESET search_path;
+RESET optimizer_enable_multiple_distinct_aggs;
+-----------------------------------------------------------------------------
+-- End of tests for multiple distinct-qualified aggregates
+-----------------------------------------------------------------------------
