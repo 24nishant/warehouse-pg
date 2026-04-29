@@ -695,13 +695,13 @@ CREATE TABLE sales (
 ) DISTRIBUTED BY (sale_key);
 
 INSERT INTO sales (sale_date, sale_key, cust_no, sale_amt)
-SELECT 
+SELECT
     '2026-04-01'::date + ((c + r) % (c % 7 + 1)) AS sale_date,
     'KEY-' || i AS sale_key,
     'C' || lpad((c + 1)::text, 4, '0') AS cust_no,
     ((c % 20 + 1) * 1000)::numeric(18,3) AS sale_amt
 FROM (
-    SELECT 
+    SELECT
         i,
         (i - 1) % 1000 AS c,
         (i - 1) / 1000 AS r
@@ -710,15 +710,15 @@ FROM (
 
 EXPLAIN (COSTS OFF, VERBOSE)
 SELECT count(*) FROM (
-  SELECT cust_no, sum(sale_amt), count(distinct sale_date) 
-  FROM sales GROUP BY cust_no 
+  SELECT cust_no, sum(sale_amt), count(distinct sale_date)
+  FROM sales GROUP BY cust_no
   HAVING sum(sale_amt) >= 100000 AND count(distinct sale_date) >= 5
 )as sub;
 
 -- Without this patch, this SQL will output 78, which is not correct
 SELECT count(*) FROM (
-  SELECT cust_no, sum(sale_amt), count(distinct sale_date) 
-  FROM sales GROUP BY cust_no 
+  SELECT cust_no, sum(sale_amt), count(distinct sale_date)
+  FROM sales GROUP BY cust_no
   HAVING sum(sale_amt) >= 100000 AND count(distinct sale_date) >= 5
 )as sub;
 
@@ -727,8 +727,8 @@ SET optimizer_enable_multiple_distinct_aggs=on;
 
 EXPLAIN (COSTS OFF, VERBOSE)
 SELECT count(*) FROM (
-  SELECT cust_no, sum(distinct sale_amt), count(distinct sale_date) 
-  FROM sales GROUP BY cust_no 
+  SELECT cust_no, sum(distinct sale_amt), count(distinct sale_date)
+  FROM sales GROUP BY cust_no
   HAVING sum(sale_amt) >= 100000 AND count(distinct sale_date) >= 5
 )as sub;
 
@@ -739,3 +739,360 @@ SELECT count(*) FROM (
 )as sub;
 
 DROP TABLE sales;
+
+-----------------------------------------------------------------------------
+-- Tests for multiple distinct-qualified aggregates
+-----------------------------------------------------------------------------
+CREATE SCHEMA IF NOT EXISTS schema_mdqa;
+SET search_path = schema_mdqa, public;
+
+SET optimizer_enable_multiple_distinct_aggs = on;
+
+-----------------------------------------------------------------------------
+-- Setup: two partitioned tables, one heap table.
+-----------------------------------------------------------------------------
+
+-- Partitioned, distributed by group-by key.
+CREATE TABLE mdqa_part(
+  a int,    -- group-by key + distribution key
+  b int,    -- DISTINCT arg
+  c int,    -- DISTINCT arg
+  d int     -- unused unless explicitly referenced
+)
+DISTRIBUTED BY (a)
+PARTITION BY RANGE(a) (
+  START (0) END (100) EVERY (50),
+  DEFAULT PARTITION other
+);
+INSERT INTO mdqa_part SELECT i, i%5, i%3, i%7 FROM generate_series(1, 100) i;
+CREATE INDEX mdqa_part_b_idx ON mdqa_part(b);
+ANALYZE mdqa_part;
+
+
+-- Partitioned, distributed by a column NOT used in the query.
+CREATE TABLE mdqa_dist_unused(
+  a int,        -- group-by key
+  b int,
+  c int,
+  dist_col int  -- distribution key, never referenced in any test query
+)
+DISTRIBUTED BY (dist_col)
+PARTITION BY RANGE(a) (
+  START (0) END (100) EVERY (50),
+  DEFAULT PARTITION other
+);
+INSERT INTO mdqa_dist_unused SELECT i, i%5, i%3, i%11
+  FROM generate_series(1, 100) i;
+ANALYZE mdqa_dist_unused;
+
+
+-- Non-partitioned control. Same shape, heap table.
+CREATE TABLE mdqa_heap(a int, b int, c int, d int) DISTRIBUTED BY (a);
+INSERT INTO mdqa_heap SELECT i, i%5, i%3, i%7 FROM generate_series(1, 100) i;
+ANALYZE mdqa_heap;
+
+
+-- Based on crashing query
+CREATE TABLE orders(
+  order_date  date,
+  account_id  int,
+  region      text,
+  order_id    int,
+  amount      numeric(15,2)
+)
+DISTRIBUTED BY (account_id)
+PARTITION BY RANGE(order_date) (
+  START ('2026-04-01'::date) END ('2026-04-08'::date) EVERY ('1 day'::interval),
+  DEFAULT PARTITION other
+);
+INSERT INTO orders
+  SELECT ('2026-04-01'::date + ((i % 7) || ' days')::interval)::date,
+         i % 20,
+         CASE WHEN i % 3 = 0 THEN 'NORTH' ELSE 'SOUTH' END,
+         i,
+         (i * 1000)::numeric(15,2)
+  FROM generate_series(1, 200) i;
+ANALYZE orders;
+
+
+-----------------------------------------------------------------------------
+-- Test 1 - minimal MDQA on partitioned table.
+-----------------------------------------------------------------------------
+EXPLAIN (COSTS OFF)
+SELECT a,
+       count(DISTINCT b) AS cnt_b,
+       count(DISTINCT c) AS cnt_c
+  FROM mdqa_part
+ GROUP BY a;
+
+-----------------------------------------------------------------------------
+-- Test 2 - with selective predicate + index to encourage a bitmap-scan emitter.
+-----------------------------------------------------------------------------
+EXPLAIN (COSTS OFF)
+SELECT a,
+       count(DISTINCT b) AS cnt_b,
+       count(DISTINCT c) AS cnt_c
+  FROM mdqa_part
+ WHERE b BETWEEN 0 AND 2
+ GROUP BY a;
+
+-----------------------------------------------------------------------------
+-- Test 3 - system column (ctid) as a DISTINCT argument.
+-- Validates the fix correctly INCLUDES referenced system columns in the
+-- CTEproducer
+-----------------------------------------------------------------------------
+EXPLAIN (COSTS OFF)
+SELECT a,
+       count(DISTINCT ctid) AS distinct_rows,
+       count(DISTINCT b)    AS distinct_b
+  FROM mdqa_part
+ GROUP BY a;
+
+-----------------------------------------------------------------------------
+-- Test 4 - group-by key referenced ONLY in GROUP BY clause —
+-----------------------------------------------------------------------------
+EXPLAIN (COSTS OFF)
+SELECT count(DISTINCT b),
+       count(DISTINCT c)
+  FROM mdqa_part
+ GROUP BY a;
+
+-----------------------------------------------------------------------------
+-- Test 5 - distribution key NOT referenced anywhere in the query.
+-----------------------------------------------------------------------------
+EXPLAIN (COSTS OFF)
+SELECT a,
+       count(DISTINCT b),
+       count(DISTINCT c)
+  FROM mdqa_dist_unused
+ GROUP BY a;
+
+-----------------------------------------------------------------------------
+-- Test 6 - MDQA with NO GROUP BY (single global aggregation).
+-----------------------------------------------------------------------------
+EXPLAIN (COSTS OFF)
+SELECT count(DISTINCT b),
+       count(DISTINCT c)
+  FROM mdqa_part;
+
+-----------------------------------------------------------------------------
+-- Test 7 - mix of agg functions
+-----------------------------------------------------------------------------
+EXPLAIN (COSTS OFF)
+SELECT a,
+       count(DISTINCT b) AS cnt_b,
+       sum(DISTINCT c)   AS sum_c,
+       avg(DISTINCT b)   AS avg_b,
+       min(DISTINCT c)   AS min_c,
+       max(DISTINCT d)   AS max_d,
+       sum(d)            AS plain_sum_d
+  FROM mdqa_part
+ GROUP BY a
+ ORDER BY a;
+
+-----------------------------------------------------------------------------
+-- Test 8 - MDQA over an inline view (subquery in FROM).
+-----------------------------------------------------------------------------
+EXPLAIN (COSTS OFF)
+SELECT a,
+       count(DISTINCT b) AS cnt_b,
+       count(DISTINCT c) AS cnt_c
+  FROM (SELECT a, b, c, d
+          FROM mdqa_part
+         WHERE d > 0) sub
+ GROUP BY a
+ ORDER BY a;
+
+-----------------------------------------------------------------------------
+-- Test 9 - NON-partitioned control for Test 1
+-----------------------------------------------------------------------------
+EXPLAIN (COSTS OFF)
+SELECT a,
+       count(DISTINCT b) AS cnt_b,
+       count(DISTINCT c) AS cnt_c
+  FROM mdqa_heap
+ GROUP BY a;
+
+-----------------------------------------------------------------------------
+-- Test 10 - no GROUP BY, heap table.
+-- Confirms the fix doesn't effect the empty-keys / heap path either.
+-----------------------------------------------------------------------------
+EXPLAIN (COSTS OFF)
+SELECT count(DISTINCT b),
+       count(DISTINCT c)
+  FROM mdqa_heap;
+
+-----------------------------------------------------------------------------
+-- Test 11 - shape-equivalent reproducer of the crashing query
+-----------------------------------------------------------------------------
+EXPLAIN (COSTS OFF)
+WITH qualified_accounts AS (
+    SELECT o.account_id AS account_id
+      FROM orders o
+     WHERE o.order_date BETWEEN '2026-04-01'::date AND '2026-04-07'::date
+       AND o.region = 'NORTH'
+     GROUP BY o.account_id
+    HAVING (sum(o.amount) >= 100000.0
+            AND count(DISTINCT o.order_date) >= 5.0)
+)
+SELECT o1.account_id,
+       sum(o1.amount)                AS amount_sum,
+       count(DISTINCT o1.order_date) AS date_cnt,
+       count(DISTINCT o1.account_id) AS account_cnt,
+       count(DISTINCT o1.order_id)   AS order_cnt
+  FROM orders o1
+       JOIN qualified_accounts qa ON (o1.account_id = qa.account_id)
+ WHERE o1.order_date BETWEEN '2026-04-01'::date AND '2026-04-07'::date
+   AND o1.region = 'NORTH'
+ GROUP BY o1.account_id;
+
+-----------------------------------------------------------------------------
+-- Test 12 - multi-column GROUP BY.
+-----------------------------------------------------------------------------
+EXPLAIN (COSTS OFF)
+SELECT a, b,
+       count(DISTINCT b) AS cnt_b,
+       count(DISTINCT c) AS cnt_c
+  FROM mdqa_part
+ GROUP BY a, b;
+
+-----------------------------------------------------------------------------
+-- Test 13 - DQAs referenced from HAVING clause, not SELECT list.
+-----------------------------------------------------------------------------
+EXPLAIN (COSTS OFF)
+SELECT a, sum(d) AS total
+  FROM mdqa_part
+ GROUP BY a
+HAVING count(DISTINCT b) > 1
+   AND count(DISTINCT c) > 1;
+
+-----------------------------------------------------------------------------
+-- Test 14 - LIST-partitioned table (not RANGE).
+-----------------------------------------------------------------------------
+CREATE TABLE mdqa_list_part(a int, b int, c int, d int)
+DISTRIBUTED BY (a)
+PARTITION BY LIST(a) (
+  PARTITION p1 VALUES (1, 2, 3),
+  PARTITION p2 VALUES (4, 5, 6),
+  DEFAULT PARTITION other
+);
+INSERT INTO mdqa_list_part SELECT i, i%5, i%3, i%7
+  FROM generate_series(1, 30) i;
+ANALYZE mdqa_list_part;
+
+EXPLAIN (COSTS OFF)
+SELECT a,
+       count(DISTINCT b) AS cnt_b,
+       count(DISTINCT c) AS cnt_c
+  FROM mdqa_list_part
+ GROUP BY a;
+
+-----------------------------------------------------------------------------
+-- Test 15 - partition-eliminated query .
+-- Confirms the narrowed producer still works when only a
+-- subset of the partitions are reachable.
+-----------------------------------------------------------------------------
+EXPLAIN (COSTS OFF)
+SELECT a,
+       count(DISTINCT b) AS cnt_b,
+       count(DISTINCT c) AS cnt_c
+  FROM mdqa_part
+ WHERE a >= 0 AND a < 50    -- prunes the [50,100) and DEFAULT partitions
+ GROUP BY a;
+
+-----------------------------------------------------------------------------
+-- Test 16 - NULL handling in DQA arguments on a partitioned table.
+-----------------------------------------------------------------------------
+INSERT INTO mdqa_part VALUES
+  (NULL, NULL, NULL, NULL),
+  (50,   NULL, 1,    NULL),
+  (51,   2,    NULL, 9);
+ANALYZE mdqa_part;
+
+EXPLAIN (COSTS OFF)
+SELECT a,
+       count(DISTINCT b) AS cnt_b,
+       count(DISTINCT c) AS cnt_c,
+       sum(DISTINCT b)   AS sum_b
+  FROM mdqa_part
+ GROUP BY a;
+
+-----------------------------------------------------------------------------
+-- Test 17 - DISTRIBUTED RANDOMLY + partitioned.
+-----------------------------------------------------------------------------
+CREATE TABLE mdqa_random_dist(a int, b int, c int, d int)
+DISTRIBUTED RANDOMLY
+PARTITION BY RANGE(a) (
+  START (0) END (100) EVERY (50),
+  DEFAULT PARTITION other
+);
+INSERT INTO mdqa_random_dist SELECT i, i%5, i%3, i%7
+  FROM generate_series(1, 100) i;
+ANALYZE mdqa_random_dist;
+
+EXPLAIN (COSTS OFF)
+SELECT a,
+       count(DISTINCT b) AS cnt_b,
+       count(DISTINCT c) AS cnt_c
+  FROM mdqa_random_dist
+ GROUP BY a;
+
+-----------------------------------------------------------------------------
+-- Test 18 - PRIMARY KEY on the group-by
+-- column, with an unused non-key column.
+-----------------------------------------------------------------------------
+CREATE TABLE mdqa_pk_grpkey(a int PRIMARY KEY, b int, c int, d int)
+DISTRIBUTED BY (a)
+PARTITION BY RANGE(a) (
+  START (0) END (100) EVERY (50),
+  DEFAULT PARTITION other
+);
+INSERT INTO mdqa_pk_grpkey SELECT i, i%5, i%3, i%7
+  FROM generate_series(1, 99) i;
+ANALYZE mdqa_pk_grpkey;
+
+EXPLAIN (COSTS OFF)
+SELECT a,
+       count(DISTINCT b) AS cnt_b,
+       count(DISTINCT c) AS cnt_c
+  FROM mdqa_pk_grpkey
+ GROUP BY a;
+
+-----------------------------------------------------------------------------
+-- Test 19 - unused column is TEXT
+-----------------------------------------------------------------------------
+CREATE TABLE mdqa_text_col(a int, b int, c int, d text)
+DISTRIBUTED BY (a)
+PARTITION BY RANGE(a) (
+  START (0) END (100) EVERY (50),
+  DEFAULT PARTITION other
+);
+INSERT INTO mdqa_text_col
+  SELECT i, i%5, i%3, 'row-' || i FROM generate_series(1, 100) i;
+ANALYZE mdqa_text_col;
+
+EXPLAIN (COSTS OFF)
+SELECT a,
+       count(DISTINCT b) AS cnt_b,
+       count(DISTINCT c) AS cnt_c
+  FROM mdqa_text_col
+ GROUP BY a;
+
+-----------------------------------------------------------------------------
+-- Cleanup
+-----------------------------------------------------------------------------
+DROP TABLE mdqa_part;
+DROP TABLE mdqa_dist_unused;
+DROP TABLE mdqa_heap;
+DROP TABLE mdqa_list_part;
+DROP TABLE mdqa_random_dist;
+DROP TABLE mdqa_pk_grpkey;
+DROP TABLE mdqa_text_col;
+DROP TABLE orders;
+DROP SCHEMA schema_mdqa;
+RESET search_path;
+RESET optimizer_enable_multiple_distinct_aggs;
+
+-----------------------------------------------------------------------------
+-- End of tests for multiple distinct-qualified aggregates
+-----------------------------------------------------------------------------
