@@ -167,7 +167,7 @@ jobs:
           CC='ccache gcc -m64' \
           CFLAGS='-O2 -g3' LDFLAGS='-Wl,--enable-new-dtags -Wl,--export-dynamic' \
           ./configure --with-quicklz --disable-gpperfmon --with-gssapi --enable-mapreduce --enable-orafce --enable-ic-proxy \
-                      --enable-orca --with-libxml --with-pythonsrc-ext --with-uuid=e2fs --with-pgport=5432 --enable-tap-tests \
+                      --enable-orca --with-libxml --with-pythonsrc-ext --with-uuid=e2fs --with-pgport=5432 --enable-tap-tests --with-llvm \
                       --enable-debug-extensions --with-perl --with-python --with-openssl --with-pam --with-ldap --with-includes="" \
                       --with-libraries="" --disable-rpath \
                       --prefix=/usr/local/greenplum-db-devel \
@@ -205,7 +205,7 @@ jobs:
         id: cluster
         run: |
           source concourse/scripts/common.bash
-          export WITH_MIRRORS=false
+          export WITH_MIRRORS=true
           make_cluster
 
       - name: Run installcheck tests
