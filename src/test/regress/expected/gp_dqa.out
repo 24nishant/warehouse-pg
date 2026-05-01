@@ -4121,10 +4121,10 @@ SELECT o1.account_id,
                                              ->  Seq Scan on orders_1_prt_8 o1_6
                                                    Filter: ((order_date >= '04-01-2026'::date) AND (order_date <= '04-07-2026'::date) AND (region = 'NORTH'::text))
                                        ->  Hash
-                                             ->  HashAggregate
+                                             ->  Finalize HashAggregate
                                                    Group Key: o.account_id
                                                    Filter: ((sum(o.amount) >= 100000.0) AND ((count(o.order_date))::numeric >= 5.0))
-                                                   ->  HashAggregate
+                                                   ->  Partial HashAggregate
                                                          Group Key: o.account_id, o.order_date
                                                          ->  Append
                                                                ->  Seq Scan on orders_1_prt_2 o
