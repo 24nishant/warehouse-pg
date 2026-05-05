@@ -48,9 +48,9 @@ select gp_inject_fault_infinite('postmaster_server_loop_no_sigkill', 'skip', dbi
 -- session 2 attempts its CREATE TABLE. Without this, on fast CI runners
 -- session 2 can dispatch before the segment is actually down.
 select pg_sleep(2);
- pg_sleep
+ pg_sleep 
 ----------
-
+          
 (1 row)
 
 -- This should fail due to the seg0 in reset mode
