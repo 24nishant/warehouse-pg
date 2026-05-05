@@ -32,6 +32,11 @@ from gp_segment_configuration where role = 'p' and content = 0;
 from gp_segment_configuration where role = 'p' AND content = 0;
 1&:create table fts_reset_t(a int);
 
+-- Wait for the PANIC to take effect and seg0 to enter RESET mode before
+-- session 2 attempts its CREATE TABLE. Without this, on fast CI runners
+-- session 2 can dispatch before the segment is actually down.
+select pg_sleep(2);
+
 -- This should fail due to the seg0 in reset mode
 2&:create table fts_reset_t2(a int);
 
