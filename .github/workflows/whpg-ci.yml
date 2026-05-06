@@ -5,8 +5,8 @@ name: WarehousePG CI
 # Change these values to update which EL versions are tested
 # =============================================================================
 env:
-  WHPG7_EL_VERSIONS: '["8","9"]'            # WHPG 7 supported EL versions
-  WHPG6_EL_VERSIONS: '["7", "8", "9"]'      # WHPG 6 supported EL versions
+  WHPG7_EL_VERSIONS: '["8", "9"]'            # WHPG 7 supported EL versions
+  WHPG6_EL_VERSIONS: '["8", "9"]'      # WHPG 6 supported EL versions
   DEFAULT_EL_VERSION: '["8"]'           # Default for feature branches
   DEFAULT_INSTALLCHECK_TARGET: 'installcheck-small'  # Default installcheck target
 
@@ -224,7 +224,7 @@ jobs:
           ln -s . gpdb_src                          # For concourse scripts compatibility
           ln -s "${WHPG_SRC}" /workspace            # Easy to remember path
           ln -s "${WHPG_SRC}" /home/gpadmin/gpdb_src  # Accessible from gpadmin home
-          # We delete the ggpadmin user for WHPG 6 compatibility as the setup script doesn't handle existing users.
+          # We delete the gpadmin user for WHPG 6 compatibility as the setup script doesn't handle existing users.
           # The userdel command is harmless in WHPG 7 as well since the setup script will recreate the user if it doesn't exist.
           userdel gpadmin 2>/dev/null || true
 

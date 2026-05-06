@@ -36,6 +36,7 @@ jobs:
       ABI_LIBS: ${{ steps.vars.outputs.ABI_LIBS }}
       ABI_HEADERS: ${{ steps.vars.outputs.ABI_HEADERS }}
       EXCEPTION_LISTS_COUNT: ${{ steps.check_exception_lists.outputs.EXCEPTION_LISTS_COUNT }}
+      WHPG_MAJOR_VERSION: ${{ steps.vars.outputs.WHPG_MAJOR_VERSION }}
     steps:
       - name: Fetch source
         uses: actions/checkout@v3
@@ -51,6 +52,7 @@ jobs:
           echo "BASELINE_VERSION=${baseline_version#'refs/tags/'}" | tee -a $GITHUB_OUTPUT
           echo "ABI_LIBS=postgres" | tee -a $GITHUB_OUTPUT
           echo "ABI_HEADERS=." | tee -a $GITHUB_OUTPUT
+          echo "WHPG_MAJOR_VERSION=${baseline_version#'refs/tags/'}" | cut -d. -f1 | tee -a $GITHUB_OUTPUT
 
       - name: Check if exception list exists
         id: check_exception_lists
@@ -105,6 +107,13 @@ jobs:
         run: |
           yum install -y epel-release
           yum install -y abi-dumper
+          yum install -y python2-devel
+
+      - name: Set up Python 2 for build (WHPG 6 only)
+        if: ${{ needs.abi-dump-setup.outputs.WHPG_MAJOR_VERSION == '6' }}
+        run: |
+          alternatives --set python /usr/bin/python2
+          python --version
 
       - name: Build
         run: |
