@@ -44,6 +44,15 @@ select gp_inject_fault_infinite('postmaster_server_loop_no_sigkill', 'skip', dbi
 (1 row)
 1&:create table fts_reset_t(a int);  <waiting ...>
 
+-- Wait for the PANIC to take effect and seg0 to enter RESET mode before
+-- session 2 attempts its CREATE TABLE. Without this, on fast CI runners
+-- session 2 can dispatch before the segment is actually down.
+select pg_sleep(2);
+ pg_sleep 
+----------
+          
+(1 row)
+
 -- This should fail due to the seg0 in reset mode
 2&:create table fts_reset_t2(a int);  <waiting ...>
 
