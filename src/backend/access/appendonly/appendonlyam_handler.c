@@ -20,6 +20,7 @@
 #include "access/appendonlywriter.h"
 #include "access/heapam.h"
 #include "access/multixact.h"
+#include "access/reloptions.h"
 #include "access/tableam.h"
 #include "access/tsmapi.h"
 #include "access/tuptoaster.h"
@@ -39,6 +40,7 @@
 #include "commands/progress.h"
 #include "commands/vacuum.h"
 #include "executor/executor.h"
+#include "optimizer/plancat.h"
 #include "pgstat.h"
 #include "storage/procarray.h"
 #include "utils/builtins.h"
@@ -2285,6 +2287,7 @@ appendonly_scan_sample_next_block(TableScanDesc scan, SampleScanState *scanstate
 	TsmRoutine 			*tsm = scanstate->tsmroutine;
 	AppendOnlyScanDesc 	aoscan = (AppendOnlyScanDesc) scan;
 	int64 				totalrows = AppendOnlyScanDesc_TotalTupCount(aoscan);
+	int32				tuplesPerBlock = aoscan->sampleTuplesPerBlock;
 
 	/* return false immediately if relation is empty */
 	if (aoscan->targrow >= totalrows)
@@ -2292,7 +2295,7 @@ appendonly_scan_sample_next_block(TableScanDesc scan, SampleScanState *scanstate
 
 	if (tsm->NextSampleBlock)
 	{
-		int64 nblocks = (totalrows + (AO_MAX_TUPLES_PER_HEAP_BLOCK - 1)) / AO_MAX_TUPLES_PER_HEAP_BLOCK;
+		int64 nblocks = (totalrows + (tuplesPerBlock - 1)) / tuplesPerBlock;
 		int64 nextblk;
 
 		nextblk = tsm->NextSampleBlock(scanstate, nblocks);
@@ -2320,7 +2323,7 @@ appendonly_scan_sample_next_block(TableScanDesc scan, SampleScanState *scanstate
 			/* target the first row of the selected block */
 			Assert(aoscan->sampleTargetBlk < nblocks);
 
-			aoscan->targrow = aoscan->sampleTargetBlk * AO_MAX_TUPLES_PER_HEAP_BLOCK;
+			aoscan->targrow = aoscan->sampleTargetBlk * tuplesPerBlock;
 			return true;
 		}
 	}
@@ -2331,7 +2334,7 @@ appendonly_scan_sample_next_block(TableScanDesc scan, SampleScanState *scanstate
 
 		/* target the first row of the next block */
 		aoscan->sampleTargetBlk++;
-		aoscan->targrow = aoscan->sampleTargetBlk * AO_MAX_TUPLES_PER_HEAP_BLOCK;
+		aoscan->targrow = aoscan->sampleTargetBlk * tuplesPerBlock;
 
 		/* ran out of blocks, scan is done */
 		if (aoscan->targrow >= totalrows)
@@ -2347,7 +2350,8 @@ appendonly_scan_sample_next_tuple(TableScanDesc scan, SampleScanState *scanstate
 {
 	TsmRoutine 			*tsm = scanstate->tsmroutine;
 	AppendOnlyScanDesc 	aoscan = (AppendOnlyScanDesc) scan;
-	int64  				currblk = aoscan->targrow / AO_MAX_TUPLES_PER_HEAP_BLOCK;
+	int32				tuplesPerBlock = aoscan->sampleTuplesPerBlock;
+	int64  				currblk = aoscan->targrow / tuplesPerBlock;
 	int64 				totalrows = AppendOnlyScanDesc_TotalTupCount(aoscan);
 
 	Assert(aoscan->sampleTargetBlk >= 0);
@@ -2364,12 +2368,12 @@ appendonly_scan_sample_next_tuple(TableScanDesc scan, SampleScanState *scanstate
 		 * Ask the tablesample method which rows to scan on this block. Refer
 		 * to AppendOnlyScanDesc->sampleTargetBlk for our blocking scheme.
 		 *
-		 * Note: unlike heapam, we are guaranteed to have
-		 * AO_MAX_TUPLES_PER_HEAP_BLOCK tuples in this block (unless this is the
-		 * last such block in the relation)
+		 * Note: unlike heapam, we are guaranteed to have sampleTuplesPerBlock
+		 * tuples in this block (unless this is the last such block in the
+		 * relation)
 		 */
-		maxoffset = Min(AO_MAX_TUPLES_PER_HEAP_BLOCK,
-						totalrows - currblk * AO_MAX_TUPLES_PER_HEAP_BLOCK);
+		maxoffset = Min(tuplesPerBlock,
+						totalrows - currblk * tuplesPerBlock);
 		targetoffset = tsm->NextSampleTuple(scanstate,
 											currblk,
 											maxoffset);
@@ -2378,7 +2382,7 @@ appendonly_scan_sample_next_tuple(TableScanDesc scan, SampleScanState *scanstate
 		{
 			Assert(targetoffset <= maxoffset);
 
-			aoscan->targrow = currblk * AO_MAX_TUPLES_PER_HEAP_BLOCK + targetoffset - 1;
+			aoscan->targrow = currblk * tuplesPerBlock + targetoffset - 1;
 			Assert(aoscan->targrow < totalrows);
 
 			if (appendonly_get_target_tuple(aoscan, aoscan->targrow, slot))
@@ -2480,4 +2484,54 @@ Datum
 ao_row_tableam_handler(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_POINTER(&ao_row_methods);
+}
+
+/*
+ * ao_compute_sample_tuples_per_block
+ *
+ * Compute the number of tuples per "logical block" for TABLESAMPLE on AO tables.
+ *
+ * For tables with small tuples (e.g., integers), this returns the maximum
+ * value (AO_MAX_TUPLES_PER_HEAP_BLOCK = 32768). For tables with large tuples
+ * (e.g., vector types where each tuple is several KB), this returns a
+ * proportionally smaller value, making sampling more efficient.
+ */
+int32
+ao_compute_sample_tuples_per_block(Relation rel)
+{
+	int32	avg_tuple_width;
+	int32	tuples_per_block;
+	bool	is_compressed = false;
+
+	if (rel->rd_options != NULL)
+	{
+		StdRdOptions *relopts = (StdRdOptions *) rel->rd_options;
+		is_compressed = (relopts->compresslevel > 0 &&
+							strcmp(relopts->compresstype, "none") != 0);
+	}
+
+	/* Get average tuple width from relation statistics */
+	avg_tuple_width = get_rel_data_width(rel, NULL);
+
+	if (avg_tuple_width <= 0)
+	{
+		/* No statistics available, fall back to default */
+		return AO_MAX_TUPLES_PER_HEAP_BLOCK;
+	}
+
+	/*
+	 * Compute tuples per block based on BLCKSZ.
+	 * - For compressed tables multiply by 2 as a rough estimate of the
+	 * compression ratio so that a "logical block" covers roughly one
+	 * physical varblock worth of on-disk bytes.
+	 * - For uncompressed tables, physical and logical sizes match, so
+	 * no multiplier is needed.
+	 */
+	tuples_per_block = is_compressed ? (BLCKSZ * 2) / avg_tuple_width : BLCKSZ / avg_tuple_width;
+
+	/* Ensure reasonable bounds */
+	tuples_per_block = Max(tuples_per_block, 32);
+	tuples_per_block = Min(tuples_per_block, AO_MAX_TUPLES_PER_HEAP_BLOCK);
+
+	return tuples_per_block;
 }
