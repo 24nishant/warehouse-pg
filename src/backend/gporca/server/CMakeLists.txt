@@ -362,7 +362,7 @@ InsertNonSingleton NonSingleton TaintedReplicatedAgg TaintedReplicatedWindowAgg 
 InsertReplicatedIntoSerialHashDistributedTable TaintedReplicatedTablesCTE ReplicatedTableWithAggNoMotion;
 
 CDqaTest:
-NonSplittableAgg DqaHavingMax DqaMax DqaMin DqaSubqueryMax DqaNoRedistribute DistinctQueryWithMotions;
+NonSplittableAgg DqaHavingMax DqaMax DqaMin DqaSubqueryMax DqaNoRedistribute DistinctQueryWithMotions MDQA_PartTable_DynScan;
 
 CMCVCardinalityTest:
 BpCharMCVCardinalityEquals BpCharMCVCardinalityGreaterThan
