@@ -237,7 +237,7 @@ CJoinCardinalityTest::EresUnittest_Join()
 			(void) col_factory->PcrCreate(
 				pmdtypeint4, default_type_modifier, CColRef::EUsed,
 				nullptr, ul /* attno */, false /*IsNullable*/, id, CName(&str),
-				false /*IsDistCol*/, false);
+				0 /*ulOpSource*/, false /*isDistCol*/);
 		}
 	}
 	cols->Release();
